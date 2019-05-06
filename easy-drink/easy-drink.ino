@@ -6,74 +6,162 @@
 #include <TimeLib.h>
 #include <DS1307RTC.h>
 #include <Encoder.h>
+#include <stdio.h>
+#include "types.h"
+
+static int serial_fputchar(const char ch, FILE *stream) { Serial.write(ch); return ch; }
+static FILE *serial_stream = fdevopen(serial_fputchar, NULL);
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 32 // OLED display height, in pixels
 
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
-#define OLED_RESET     4 // Reset pin # (or -1 if sharing Arduino reset pin)
+#define OLED_RESET     5 // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-namespace AdjustMode {
-  enum AdjustMode_t {
-    NONE,
-    HOURS,
-    MINUTES,
-    TEMPERATURE
-  };  
-}
-
-#define CLK_PIN 3
-#define DT_PIN 4
-#define SWITCH_PIN 2
+// Encoder pins definitions
+#define CLK_PIN 2
+#define DT_PIN 3
+#define SWITCH_PIN 4
 
 Encoder encoder(CLK_PIN, DT_PIN);
 
-tmElements_t alarm_time;
-int temperature = 90;
-int mode = AdjustMode::NONE;
+#define REDRAW_INTERVAL 500
 
-int buttonState;             // the current reading from the input pin
-int lastButtonState = LOW;   // the previous reading from the input pin
+EventQueue_t queue;
 
-// the following variables are unsigned longs because the time, measured in
-// milliseconds, will quickly become a bigger number than can be stored in an int.
-unsigned long lastDebounceTime = 0;  // the last time the output pin was toggled
-unsigned long debounceDelay = 50;    // the debounce time; increase if the output flickers
+void queue_init(EventQueue_t & q) {
+  q.start_ = 0;
+  q.end_ = 0;
+  q.data[0] = Events::NO_EVENT;
+}
+
+void queue_push_back(EventQueue_t& q, Events::Events_t e) {
+  q.data[q.end_] = e;  
+  q.end_ = (q.end_ + 1 >= EVENT_QUEUE_SIZE) ? 0 : q.end_ + 1;
+}
+
+Events::Events_t queue_pop_front(EventQueue_t& q) {
+ Events::Events_t result = Events::NO_EVENT;
+  if (q.start_ != q.end_) {
+    result = q.start_;
+    q.start_ = (q.start_ + 1 >= EVENT_QUEUE_SIZE) ? 0 : q.start_ + 1;
+  }
+  return result;
+}
+
+
+StateData stateData;
+
+ViewFunc state2View[] = {
+  standby_view  // STANDBY
+};
+
+HandlerFunc event2Handler[] = {
+  handle_next_tick, // NEXT_TICK
+  handle_redraw
+};
+
+char textBuf[20];
+
+void init_state() {
+  stateData.state = State::STANDBY;
+}
+
+void dispatch(Events::Events_t e) {
+  queue_push_back(queue, e);  
+}
+
+void handle_next_tick() {
+  static unsigned long last_tick = 0;  
+  if (millis() - last_tick > REDRAW_INTERVAL) {
+    last_tick = millis();
+    RTC.read(stateData.curr_time);
+    dispatch(Events::REDRAW);
+  }
+  dispatch(Events::NEXT_TICK);
+}
+
+void handle_redraw() {  
+  state2View[stateData.state]();
+}
+
+void standby_view() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  display.setCursor(10,10);
+  sprintf(textBuf, "%02d:%02d", stateData.curr_time.Hour, stateData.curr_time.Minute);
+  display.print(textBuf);
+  display.display();
+}
+
+/**
+ * Prints message on the display
+ * Clears it before printing
+ * 
+ * @param msg - null terminated ascii string
+ */
+void oled_print(const char* msg) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(10,10);
+  display.print(msg);
+  display.display();
+}
 
 void setup() {
   Serial.begin(9600);
   while (!Serial) ; // wait for serial
+
   pinMode(SWITCH_PIN, INPUT);
   delay(200);
-  // put your setup code here, to run once:
+
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x32
     Serial.println(F("SSD1306 allocation failed"));
     for(;;); // Don't proceed, loop forever
+  } 
+
+  display.clearDisplay();  
+  display.display();
+
+  /**
+   *  Checking for real time clock availability
+   */  
+  byte readResult = RTC.read(stateData.curr_time);
+  if (RTC.chipPresent()) {      
+      if (!readResult) {        
+        oled_print("E: RTC not set");        
+        for(;;); // Don't proceed, loop forever
+      }      
+  } else {
+      oled_print("E: RTC is NC");      
+      for(;;); // Don't proceed, loop forever
   }
 
-  // Show initial display buffer contents on the screen --
-  // the library initializes this with an Adafruit splash screen.
-  display.display();
-  delay(2000); // Pause for 2 seconds
-  // Clear the buffer
-  display.clearDisplay();
-  display.display();
+  init_state();
+  queue_init(queue);
+  dispatch(Events::NEXT_TICK);
 }
 
-void print2digits(int number) {
-  if (number >= 0 && number < 10) {
-    Serial.write('0');
+void loop() {    
+  Events::Events_t e = queue_pop_front(queue);
+  if (e != Events::NO_EVENT) {
+    event2Handler[e]();
+  } else {
+    dispatch(Events::NEXT_TICK);
   }
-  Serial.print(number);
-}
-
-void loop() {
-  tmElements_t tm;
-  int encoderPos = encoder.read();
+  /*tmElements_t tm;
+  bool timeReadResult = false;
+  if (encoderPos != encoder.read() / 4) {
+    encoderPos = encoder.read() / 4;
+    Serial.println(encoderPos);
+  }*/ 
+  /*int encoderPos = encoder.read();
   // read the state of the switch into a local variable:
   int reading = digitalRead(SWITCH_PIN);
-  bool timeReadResult = false;
+  
 
   // check to see if you just pressed the button
   // (i.e. the input went from LOW to HIGH), and you've waited long enough
@@ -137,9 +225,9 @@ void loop() {
       break;
     default:
       break;
-  }
+  }*/
 
-  if (mode == AdjustMode::NONE) {
+  /*if (mode == AdjustMode::NONE) {
     timeReadResult = RTC.read(tm);
   } else {
     timeReadResult = true;
@@ -149,19 +237,19 @@ void loop() {
   }
   
   if (timeReadResult) {
-    Serial.print("Ok, Time = ");
-    print2digits(tm.Hour);
-    Serial.write(':');
-    print2digits(tm.Minute);
-    Serial.write(':');
-    print2digits(tm.Second);
-    Serial.print(", Date (D/M/Y) = ");
-    Serial.print(tm.Day);
-    Serial.write('/');
-    Serial.print(tm.Month);
-    Serial.write('/');
-    Serial.print(tmYearToCalendar(tm.Year));
-    Serial.println();
+    //Serial.print("Ok, Time = ");
+    //print2digits(tm.Hour);
+    //Serial.write(':');
+    //print2digits(tm.Minute);
+    //Serial.write(':');
+    //print2digits(tm.Second);
+    //Serial.print(", Date (D/M/Y) = ");
+    //Serial.print(tm.Day);
+    //Serial.write('/');
+    //Serial.print(tm.Month);
+    //Serial.write('/');
+    //Serial.print(tmYearToCalendar(tm.Year));
+    //Serial.println();
     
     display.clearDisplay();
     
@@ -188,5 +276,5 @@ void loop() {
       Serial.println();
     }
     delay(2000);
-  }
+  }*/
 }
